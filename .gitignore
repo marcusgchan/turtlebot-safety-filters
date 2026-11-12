@@ -1,0 +1,8 @@
+build/
+install/
+log/
+
+__pycache__/
+
+browse.vc.db
+browse.vc.db.lock
