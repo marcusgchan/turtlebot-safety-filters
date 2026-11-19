@@ -8,6 +8,8 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from scipy.interpolate import RegularGridInterpolator
 
+from my_robot_controller_msgs.msg import ObstacleArray
+
 DEFAULT_VALUE_FUNCTION_PATH = str(
     Path.home() / "repos" / "optimized_dp" / "turtlebot_4d_avoid_value_function.npz"
 )
@@ -35,22 +37,31 @@ class SafetyFilter(Node):
     def __init__(self):
         super().__init__("safety_filter")
         self.declare_parameter("value_function_path", DEFAULT_VALUE_FUNCTION_PATH)
-        self.declare_parameter("safety_margin", 0.3)
-        self.declare_parameter("release_margin", 0.5)
+        self.declare_parameter("safety_margin", 0.15)
+        self.declare_parameter("release_margin", 0.25)
         self.declare_parameter("input_topic", "cmd_vel_raw")
         self.declare_parameter("output_topic", "cmd_vel")
         # One-step Euler horizon used to turn the optimal acceleration into a
         # commanded speed for turtlebot3's velocity-controlled cmd_vel.
         self.declare_parameter("accel_dt", 0.1)
+        self.declare_parameter("obstacle_topic", "detected_obstacles")
+        # How stale detected_obstacles can be before we no longer trust it.
+        # Fail-safe: no recent obstacle data means we stop, not pass commands
+        # through -- the opposite of latest_state below, where no odom yet
+        # just means we have nothing to filter against.
+        self.declare_parameter("obstacle_timeout", 0.5)
 
         value_function_path = self.get_parameter("value_function_path").value
         self.safety_margin = self.get_parameter("safety_margin").value
         self.release_margin = self.get_parameter("release_margin").value
         self.accel_dt = self.get_parameter("accel_dt").value
+        self.obstacle_timeout = self.get_parameter("obstacle_timeout").value
 
         self._load_value_function(value_function_path)
 
         self.latest_state = None  # (x, y, v, theta)
+        self.obstacles = []  # [(x, y, radius), ...] in the same frame as latest_state
+        self.last_obstacle_msg_time = None
         self.overriding = False
         self.stopped = False
 
@@ -61,10 +72,16 @@ class SafetyFilter(Node):
             Twist, self.get_parameter("input_topic").value, self.cmd_callback, 10
         )
         self.odom_sub = self.create_subscription(Odometry, "odom", self.odom_callback, 10)
+        self.obstacle_sub = self.create_subscription(
+            ObstacleArray,
+            self.get_parameter("obstacle_topic").value,
+            self.obstacle_callback,
+            10,
+        )
 
         self.get_logger().info(
-            f"Safety filter active: obstacle center {self.obstacle_center}, "
-            f"radius {self.obstacle_radius}, safety margin {self.safety_margin}"
+            f"Safety filter active: solved obstacle radius {self.obstacle_radius}, "
+            f"safety margin {self.safety_margin}"
         )
 
     def _load_value_function(self, path):
@@ -107,6 +124,33 @@ class SafetyFilter(Node):
         speed = msg.twist.twist.linear.x
         self.latest_state = (pos.x, pos.y, speed, yaw)
 
+    def obstacle_callback(self, msg):
+        self.obstacles = [(o.x, o.y, o.radius) for o in msg.obstacles]
+        self.last_obstacle_msg_time = self.get_clock().now()
+
+    def _worst_case_value(self, x, y, v, theta):
+        """Transforms (x, y) into each detected obstacle's frame and queries
+        the (obstacle-relative) value function there in one batched call,
+        returning the value and gradients for whichever obstacle is most
+        dangerous (lowest V). With no detected obstacles this returns +inf --
+        clear by definition."""
+        if not self.obstacles:
+            return math.inf, 0.0, 0.0
+
+        obstacle_xy = np.array([(ox, oy) for ox, oy, _radius in self.obstacles])
+        dx = np.clip(x - obstacle_xy[:, 0], self.min_bounds[0], self.max_bounds[0])
+        dy = np.clip(y - obstacle_xy[:, 1], self.min_bounds[1], self.max_bounds[1])
+        points = np.column_stack([dx, dy, np.full_like(dx, v), np.full_like(dx, theta)])
+
+        values = self.v_interp(points)
+        worst_idx = int(np.argmin(values))
+        worst_point = points[worst_idx : worst_idx + 1]
+
+        worst_value = float(values[worst_idx])
+        worst_dvdv = float(self.dvdv_interp(worst_point)[0])
+        worst_dvdtheta = float(self.dvdtheta_interp(worst_point)[0])
+        return worst_value, worst_dvdv, worst_dvdtheta
+
     def cmd_callback(self, msg):
         if self.stopped:
             self.cmd_pub.publish(Twist())
@@ -116,16 +160,32 @@ class SafetyFilter(Node):
             self.cmd_pub.publish(msg)
             return
 
-        x, y, v, theta = self.latest_state
-        # Clamp to the solved grid -- the value function is only valid
-        # inside its bounds, and RegularGridInterpolator's linear
-        # extrapolation outside them gives no safety guarantee.
-        x = min(max(x, self.min_bounds[0]), self.max_bounds[0])
-        y = min(max(y, self.min_bounds[1]), self.max_bounds[1])
-        v = min(max(v, self.min_bounds[2]), self.max_bounds[2])
-        point = np.array([[x, y, v, theta]])
+        if self.last_obstacle_msg_time is None:
+            # Never heard from the obstacle detector -- unlike latest_state
+            # above, we can't treat "no data" as "nothing to filter against":
+            # the detector might just be down. Fail safe, not open.
+            self.get_logger().warn(
+                "No obstacle data received yet -- stopping.", throttle_duration_sec=2.0
+            )
+            self.cmd_pub.publish(Twist())
+            return
 
-        value = float(self.v_interp(point)[0])
+        age = (self.get_clock().now() - self.last_obstacle_msg_time).nanoseconds / 1e9
+        if age > self.obstacle_timeout:
+            self.get_logger().warn(
+                f"Obstacle data stale ({age:.2f}s old) -- stopping.",
+                throttle_duration_sec=2.0,
+            )
+            self.cmd_pub.publish(Twist())
+            return
+
+        x, y, v, theta = self.latest_state
+        # v is a grid axis regardless of obstacle position; x, y are clamped
+        # per-obstacle inside _worst_case_value, since that's relative to each
+        # obstacle's own frame.
+        v = min(max(v, self.min_bounds[2]), self.max_bounds[2])
+
+        value, dvdv, dvdtheta = self._worst_case_value(x, y, v, theta)
 
         # Hysteresis: trigger the override at safety_margin, but only hand
         # control back once clearly past release_margin. Without this gap,
@@ -146,9 +206,6 @@ class SafetyFilter(Node):
                 )
                 self.cmd_pub.publish(Twist())
                 return
-
-        dvdv = float(self.dvdv_interp(point)[0])
-        dvdtheta = float(self.dvdtheta_interp(point)[0])
 
         # Optimal "max" control: pushes V (distance from the unsafe/avoid
         # set) up as fast as possible, matching DubinsCar4.opt_ctrl with
@@ -178,9 +235,18 @@ class SafetyFilter(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = SafetyFilter()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Most diff-drive controllers have no command watchdog -- they keep
+        # executing the last Twist they received forever, not just until the
+        # publisher goes away. Without this, Ctrl-C leaves the robot coasting
+        # on whatever was last commanded.
+        node.cmd_pub.publish(Twist())
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

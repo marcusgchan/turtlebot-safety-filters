@@ -9,6 +9,8 @@ python examples/turtlebot_4d_avoid_test.py
 
 ## Build the package
 
+Prerequsits: enter into environment with ros installed.
+
 ```sh
 colcon build --packages-select my_robot_controller --symlink-install
 ```
@@ -21,24 +23,16 @@ Run the following command on the turtlebot:
 ros2 launch turtlebot3_bringup robot.launch.py
 ```
 
-Start up the drive_foward node and safety_filter node. You have 2 options. You can run in 2 seperate terminals or with 1 terminal using a launch command
+Ensure your laptop can reach the robot. You can test with ros topic list command.
 
-### Launching with 2 terminals
-
-Open 2 terminals and run the safety filter node in the first terminal:
-
-```sh
-ros2 run my_robot_controller safety_filter
-```
-
-Run the drive foward node in the second terminal:
-
-```sh
-ros2 run my_robot_controller drive_forward --ros-args -r cmd_vel:=cmd_vel_raw
-```
-
-### Using launch command
+Use the launch command on your laptop to automatically, launch the 3 nodes (obstacle_detector, safety_filter, drive_foward).
 
 ```sh
 ros2 launch my_robot_controller safety_filter.launch.py
+```
+
+If you want Lidar infomation, launch visualizer node:
+
+```sh
+ros2 launch my_robot_controller obstacle_detector.launch.py
 ```

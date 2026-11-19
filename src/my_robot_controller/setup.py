@@ -32,6 +32,8 @@ setup(
             "test_node = my_robot_controller.first_node:main",
             "drive_forward = my_robot_controller.drive_forward:main",
             "safety_filter = my_robot_controller.safety_filter:main",
+            "obstacle_detector = my_robot_controller.obstacle_detector:main",
+            "debug_visualizer = my_robot_controller.debug_visualizer:main",
         ],
     },
 )
